@@ -1,14 +1,12 @@
 {
-  "name": "server",
+  "name": "yugiohcgmd-ws-server",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
     "ws": "^8.19.0"
   }

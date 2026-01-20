@@ -96,18 +96,22 @@ function tryMatch(roomId) {
 
   matches.set(matchId, { p1, p2, roomId, rps: {} });
 
-  // manda pros dois
+  // ✅ envia match encontrado (e o front decide ir pro RPS)
   send(p1, { type: "VIEW", view: "found" });
   send(p2, { type: "VIEW", view: "found" });
+
+  // ⚠️ host/port do EDOPro:
+  // No Railway você normalmente só tem 1 porta pública.
+  // Aqui deixamos placeholders e depois você vai apontar pro seu "DuelHost" real.
+  const host = process.env.DUEL_HOST || "AUTO";
+  const port = Number(process.env.DUEL_PORT || 0);
 
   send(p1, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    // ✅ por enquanto: mesmo servidor WS como host “lógico”
-    // (depois a gente troca para IP/porta do host do duelo no EDOPro)
-    host: "AUTO",
-    port: 0,
+    host,
+    port,
     you: { userId: c1.userId, username: c1.username },
     opponent: { userId: c2.userId, username: c2.username }
   });
@@ -116,22 +120,16 @@ function tryMatch(roomId) {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host: "AUTO",
-    port: 0,
+    host,
+    port,
     you: { userId: c2.userId, username: c2.username },
     opponent: { userId: c1.userId, username: c1.username }
   });
-
-  // ✅ Se você quiser pular RPS e já iniciar, faça aqui.
-  // Por enquanto, vamos manter RPS:
-  send(p1, { type: "VIEW", view: "rps" });
-  send(p2, { type: "VIEW", view: "rps" });
 }
 
 wss.on("connection", (ws) => {
   console.log("Cliente conectado");
 
-  // ✅ cria estado do cliente
   clients.set(ws, {
     userId: null,
     username: "Duelista",
@@ -139,7 +137,8 @@ wss.on("connection", (ws) => {
     matchId: null
   });
 
-  // estado inicial compatível com seu App atual
+  // estado inicial compatível
+  send(ws, { type: "AUTH_OK" });
   send(ws, { type: "VIEW", view: "lobby" });
 
   ws.on("message", (buf) => {
@@ -153,42 +152,20 @@ wss.on("connection", (ws) => {
 
     // ------------------ SET_USER ------------------
     if (msg.type === "SET_USER") {
-      c.userId = msg.userId || c.userId; // opcional
+      c.userId = msg.userId || c.userId;
       c.username = msg.username || "Duelista";
       send(ws, { type: "USER", username: c.username });
       send(ws, { type: "VIEW", view: "lobby" });
       return;
     }
 
-    // ------------------ FIND_MATCH (do seu App novo) ------------------
+    // ------------------ FIND_MATCH ------------------
     if (msg.type === "FIND_MATCH") {
       const roomId = msg.roomId || "random_free";
       c.roomId = roomId;
 
-      // limpa estados anteriores
       removeFromQueues(ws);
       c.matchId = null;
-
-      // entra em searching
-      send(ws, { type: "VIEW", view: "searching" });
-
-      const q = ensureQueue(roomId);
-      if (!q.includes(ws)) q.push(ws);
-
-      tryMatch(roomId);
-      return;
-    }
-
-    // ------------------ MATCHMAKE (se você ainda usar em algum lugar) ------------------
-    if (msg.type === "MATCHMAKE") {
-      const roomId = msg.roomId || "random_free";
-      const username = msg.username || c.username || "Duelista";
-
-      removeFromQueues(ws);
-      c.matchId = null;
-
-      c.roomId = roomId;
-      c.username = username;
 
       send(ws, { type: "VIEW", view: "searching" });
 
@@ -214,7 +191,7 @@ wss.on("connection", (ws) => {
       const match = matches.get(c.matchId);
       if (!match) return;
 
-      const key = c.userId || c.username; // identificador
+      const key = c.userId || c.username;
       match.rps[key] = msg.choice;
 
       const c1 = clients.get(match.p1);
@@ -224,17 +201,9 @@ wss.on("connection", (ws) => {
       const have1 = match.rps[c1.userId || c1.username];
       const have2 = match.rps[c2.userId || c2.username];
 
-      // quando os 2 escolherem:
       if (have1 && have2) {
         broadcastMatch(c.matchId, { type: "VIEW", view: "duel" });
-
-        // ✅ Aqui depois a gente troca para iniciar o EDOPro de verdade.
-        // Por enquanto só sinaliza que o duelo pode começar.
-        broadcastMatch(c.matchId, {
-          type: "DUEL_READY",
-          matchId: c.matchId,
-          roomId: match.roomId
-        });
+        broadcastMatch(c.matchId, { type: "DUEL_READY", matchId: c.matchId, roomId: match.roomId });
       }
       return;
     }
@@ -250,7 +219,7 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ✅ Keep-alive (Railway/Proxy às vezes derruba conexão idle)
+// ✅ Keep-alive
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState === WebSocket.OPEN) {

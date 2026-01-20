@@ -1,11 +1,16 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Auth from "./components/Auth";
 import { auth } from "./firebase";
 import { connectWS, sendWS } from "./ws";
 
 type View = "auth" | "lobby" | "searching" | "found" | "error";
 
-type RoomId = "random_500" | "random_800" | "random_1000" | "random_1500" | "random_free";
+type RoomId =
+  | "random_500"
+  | "random_800"
+  | "random_1000"
+  | "random_1500"
+  | "random_free";
 
 type ServerMsg =
   | { type: "AUTH_OK" }
@@ -18,7 +23,7 @@ type ServerMsg =
       roomId: RoomId;
       host: string; // ip/dns
       port: number;
-      pass?: string; // (opcional) por enquanto vazio
+      pass?: string;
       you?: { userId: string; username: string };
       opponent?: { userId: string; username: string };
     }
@@ -32,6 +37,13 @@ function safeJson(raw: any) {
   } catch {
     return null;
   }
+}
+
+function canLaunch(host: string, port: number) {
+  if (!host) return false;
+  if (host === "AUTO") return false;
+  if (!Number.isFinite(port) || port <= 0) return false;
+  return true;
 }
 
 // ✅ abre o launcher via protocolo (se estiver registrado no Windows)
@@ -51,7 +63,7 @@ const ROOMS: { id: RoomId; title: string; subtitle: string }[] = [
   { id: "random_800", title: "Random Duel 800", subtitle: "Deck <= 800 WizardMoney" },
   { id: "random_1000", title: "Random Duel 1000", subtitle: "Deck <= 1000 WizardMoney" },
   { id: "random_1500", title: "Random Duel 1500", subtitle: "Deck <= 1500 WizardMoney" },
-  { id: "random_free", title: "Random Duel Livre", subtitle: "Sem limite (BO1)" },
+  { id: "random_free", title: "Random Duel Livre", subtitle: "Sem limite (BO1)" }
 ];
 
 const App: React.FC = () => {
@@ -69,51 +81,82 @@ const App: React.FC = () => {
     opponentName?: string;
   }>(null);
 
-  const selectedRoom = useMemo(() => ROOMS.find((r) => r.id === roomId)!, [roomId]);
+  // flags para não repetir ações
+  const didConnectRef = useRef(false);
+  const didAuthWsRef = useRef(false);
+  const pendingLoginRef = useRef<{ username: string } | null>(null);
+
+  const selectedRoom = useMemo(
+    () => ROOMS.find((r) => r.id === roomId)!,
+    [roomId]
+  );
 
   // ✅ WS: conecta 1 vez e escuta eventos
   useEffect(() => {
+    if (didConnectRef.current) return;
+    didConnectRef.current = true;
+
     connectWS((raw: any) => {
       const msg = safeJson(raw) as ServerMsg | null;
       if (!msg) return;
 
       console.log("📩 WS:", msg);
 
-      if (msg.type === "VIEW" && msg.view) setView(msg.view);
+      if (msg.type === "VIEW" && msg.view) {
+        // não deixa server te jogar pra auth do nada (auth é só local)
+        if (msg.view !== "auth") setView(msg.view);
+      }
+
+      if (msg.type === "AUTH_OK") {
+        // servidor respondeu ok (se você quiser usar isso)
+        return;
+      }
 
       if (msg.type === "AUTH_FAIL") {
         setErr(msg.reason || "Falha ao autenticar no servidor.");
         setView("error");
+        return;
       }
 
       if (msg.type === "ERROR") {
         setErr(msg.message || "Erro desconhecido.");
         setView("error");
+        return;
       }
 
       if (msg.type === "MATCH_CANCELLED") {
         setErr("O oponente saiu. Tente novamente.");
         setMatch(null);
         setView("lobby");
+        return;
       }
 
       if (msg.type === "MATCH_FOUND") {
-        setMatch({
+        const m = {
           matchId: msg.matchId,
           host: msg.host,
           port: msg.port,
           pass: msg.pass,
           roomId: msg.roomId,
-          opponentName: msg.opponent?.username,
-        });
+          opponentName: msg.opponent?.username
+        };
+
+        setMatch(m);
+        setErr(null);
         setView("found");
 
-        // ✅ abre automaticamente
-        launchEdopro({ host: msg.host, port: msg.port, pass: msg.pass });
+        // ✅ Só tenta abrir automaticamente se host/porta forem válidos
+        if (canLaunch(m.host, m.port)) {
+          launchEdopro({ host: m.host, port: m.port, pass: m.pass });
+        } else {
+          console.log("ℹ️ Host/porta ainda não configurados para auto-join:", m.host, m.port);
+        }
+        return;
       }
     });
   }, []);
 
+  // ✅ depois do login (Auth), autentica o WS com token + uid
   const onLoginSuccess = async (name: string) => {
     setUsername(name);
     setErr(null);
@@ -125,25 +168,35 @@ const App: React.FC = () => {
       return;
     }
 
-    // ✅ AUTH do WS (token + uid)
-    const token = await u.getIdToken();
-    sendWS({ type: "AUTH", token, userId: u.uid });
+    pendingLoginRef.current = { username: name };
 
-    // ✅ manda username pro backend
-    sendWS({ type: "SET_USER", username: name });
+    try {
+      const token = await u.getIdToken();
 
-    // UI
-    setView("lobby");
+      // evita mandar AUTH repetido
+      if (!didAuthWsRef.current) {
+        sendWS({ type: "AUTH", token, userId: u.uid });
+        didAuthWsRef.current = true;
+      }
+
+      // manda perfil (sempre ok mandar)
+      sendWS({ type: "SET_USER", username: name, userId: u.uid });
+
+      setView("lobby");
+    } catch (e: any) {
+      setErr("Falha ao pegar token do Firebase: " + (e?.message || "erro"));
+      setView("error");
+    }
   };
 
-  const findMatch = async () => {
+  const findMatch = () => {
     setErr(null);
     setMatch(null);
     setView("searching");
 
     sendWS({
       type: "FIND_MATCH",
-      roomId,
+      roomId
     });
   };
 
@@ -182,7 +235,9 @@ const App: React.FC = () => {
                 onClick={() => setRoomId(r.id)}
                 disabled={view === "searching"}
                 className={`text-left p-4 rounded-xl border transition-all disabled:opacity-50 ${
-                  roomId === r.id ? "border-blue-500 bg-blue-500/10" : "border-white/10 bg-white/5 hover:bg-white/8"
+                  roomId === r.id
+                    ? "border-blue-500 bg-blue-500/10"
+                    : "border-white/10 bg-white/5 hover:bg-white/8"
                 }`}
               >
                 <div className="font-black">{r.title}</div>
@@ -193,7 +248,8 @@ const App: React.FC = () => {
 
           <div className="mt-6 flex items-center justify-between gap-4">
             <div className="text-xs text-white/40">
-              Sala selecionada: <span className="text-white/80 font-bold">{selectedRoom.title}</span>
+              Sala selecionada:{" "}
+              <span className="text-white/80 font-bold">{selectedRoom.title}</span>
             </div>
 
             {view === "lobby" && (
@@ -226,6 +282,7 @@ const App: React.FC = () => {
           {view === "found" && match && (
             <div className="mt-6 p-5 rounded-xl border border-green-500/30 bg-green-500/10">
               <div className="font-black text-green-300">Duelo encontrado!</div>
+
               <div className="text-xs text-white/60 mt-2">
                 Match: <b>{match.matchId}</b> • Sala: <b>{match.roomId}</b>
                 {match.opponentName ? (
@@ -235,9 +292,17 @@ const App: React.FC = () => {
                   </>
                 ) : null}
               </div>
+
               <div className="text-xs text-white/60 mt-1">
                 Host: <b>{match.host}:{match.port}</b>
               </div>
+
+              {!canLaunch(match.host, match.port) && (
+                <div className="mt-4 text-xs text-yellow-200/80">
+                  ⚠️ Seu servidor ainda não está enviando um <b>host/porta real</b> do duelo.
+                  No Railway isso costuma ser “1 porta só”, então o auto-join do EDOPro não funciona ainda.
+                </div>
+              )}
 
               <div className="mt-4 text-xs text-white/40">
                 Se não abriu automaticamente, seu protocolo <b>yugiohcgmd://</b> não está registrado no Windows.
@@ -245,13 +310,17 @@ const App: React.FC = () => {
 
               <div className="mt-4 flex gap-3">
                 <button
+                  disabled={!canLaunch(match.host, match.port)}
                   onClick={() => launchEdopro({ host: match.host, port: match.port, pass: match.pass })}
-                  className="px-4 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-xs font-black uppercase tracking-widest"
+                  className="px-4 py-2 rounded-lg bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:hover:bg-green-600 text-xs font-black uppercase tracking-widest"
                 >
                   Abrir Engine
                 </button>
                 <button
-                  onClick={() => setView("lobby")}
+                  onClick={() => {
+                    setMatch(null);
+                    setView("lobby");
+                  }}
                   className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/15 text-xs uppercase tracking-widest"
                 >
                   Voltar
