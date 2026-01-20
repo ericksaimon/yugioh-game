@@ -1,4 +1,4 @@
-﻿# ===== segredos (NUNCA subir) =====
+﻿# ===== segredos =====
 .env
 server/firebase-admin.json
 *.pem
@@ -9,10 +9,11 @@ node_modules/
 dist/
 .vite/
 
-# ===== EDOPro / engine / binários (NUNCA subir) =====
+# ===== engine / edopro / binários / submodules =====
 EDOPro/
 Multirole/
 ocgcore/
+
 server/duel/*.exe
 server/duel/*.dll
 server/duel/*.so
