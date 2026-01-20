@@ -1,0 +1,108 @@
+
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yu-Gi-Oh! KaibaCorp Premium Terminal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Rajdhani:wght@500;600;700&family=Exo+2:wght@400;600;800&display=swap');
+        
+        :root {
+            --kc-blue: #2563eb;
+            --kc-red: #e11d48;
+            --kc-silver: #d1d5db;
+            --kc-bg: #05070a;
+        }
+
+        body {
+            font-family: 'Exo 2', sans-serif;
+            background-color: var(--kc-bg);
+            color: #fff;
+            margin: 0;
+            overflow: hidden;
+            background-image: 
+                radial-gradient(circle at 50% 50%, rgba(37, 99, 235, 0.1) 0%, transparent 80%),
+                linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+            background-size: 100% 100%, 30px 30px, 30px 30px;
+        }
+
+        .font-tech { font-family: 'Rajdhani', sans-serif; }
+        .font-premium { font-family: 'Cinzel', serif; }
+
+        .metallic-silver {
+            background: linear-gradient(135deg, #9ca3af 0%, #ffffff 50%, #9ca3af 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 0 2px rgba(255,255,255,0.3));
+        }
+
+        .premium-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(12px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        }
+
+        .sidebar-premium {
+            background: linear-gradient(180deg, #0a0e14 0%, #111827 100%);
+            border-right: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-kc-blue {
+            background: linear-gradient(to right, #1e40af, #2563eb);
+            border: 1px solid rgba(255,255,255,0.2);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .btn-kc-blue:hover {
+            box-shadow: 0 0 20px rgba(37, 99, 235, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .stat-box {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.2s;
+        }
+
+        .stat-box:hover {
+            border-color: var(--kc-blue);
+            background: rgba(37, 99, 235, 0.05);
+        }
+
+        @keyframes scan {
+            from { top: -100%; }
+            to { top: 100%; }
+        }
+
+        .scan-line {
+            position: absolute;
+            width: 100%;
+            height: 4px;
+            background: linear-gradient(to bottom, transparent, rgba(37, 99, 235, 0.2), transparent);
+            animation: scan 6s linear infinite;
+            pointer-events: none;
+        }
+
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 10px; }
+    </style>
+<script type="importmap">
+{
+  "imports": {
+    "react/": "https://esm.sh/react@^19.2.3/",
+    "react": "https://esm.sh/react@^19.2.3",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/"
+  }
+}
+</script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="module" src="./index.tsx"></script>
+</body>
+</html>

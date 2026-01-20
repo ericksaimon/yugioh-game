@@ -1,0 +1,5 @@
+{
+  "name": "Yu-Gi-Oh! Nexus Simulator",
+  "description": "A comprehensive, high-fidelity Yu-Gi-Oh! TCG simulator following official rules, featuring multiplayer capabilities, card database integration, and all classic summoning mechanics (Fusion, Ritual, Synchro, Xyz).",
+  "requestFramePermissions": []
+}
