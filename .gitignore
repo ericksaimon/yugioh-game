@@ -24,3 +24,9 @@ server/duel/*.dat
 # ===== logs / temp =====
 *.log
 tmp/
+
+server/firebase-admin.json
+.env
+*.key
+*.pem
+
