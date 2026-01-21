@@ -2,23 +2,42 @@ const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
 
-const PORT = process.env.PORT || 3001;
+// ✅ Fly usa internal_port=8080 no proxy.
+// Em muitos casos o Fly injeta PORT=8080.
+// Se não injetar, a gente FORÇA 8080 como padrão (não 3001).
+const PORT = Number(process.env.PORT || 8080);
+const HOST = "0.0.0.0";
 
-// HTTP server (Railway healthcheck)
+// ✅ Se você quiser mandar um host/porta real pro launcher (quando tiver duel server),
+// configure no Fly Secrets/Env:
+// DUEL_HOST = "seu-duelhost.fly.dev" (ou domínio/IP)
+// DUEL_PORT = "7911"
+const DEFAULT_PUBLIC_HOST = process.env.PUBLIC_HOST || process.env.FLY_APP_NAME
+  ? `${process.env.FLY_APP_NAME}.fly.dev`
+  : "localhost";
+
+const DUEL_HOST = process.env.DUEL_HOST || DEFAULT_PUBLIC_HOST;
+const DUEL_PORT = Number(process.env.DUEL_PORT || 7911);
+const DUEL_PASS = ""; // sem senha como você quer
+
+// HTTP server (healthcheck + fallback)
 const server = http.createServer((req, res) => {
-  if (req.url === "/" || req.url === "/health") {
+  // responde OK para healthcheck e rota raiz
+  if (req.url === "/health" || req.url === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("OK");
-    return;
+    return res.end("OK");
   }
-  res.writeHead(404, { "Content-Type": "text/plain" });
-  res.end("Not Found");
+
+  // fallback 200 (evita proxy/health reclamar por 404)
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
 });
 
 // WebSocket em cima do mesmo HTTP server
 const wss = new WebSocket.Server({ server });
 
-console.log(`✅ HTTP+WS iniciando... PORT=${PORT}`);
+console.log(`✅ HTTP+WS iniciando... HOST=${HOST} PORT=${PORT}`);
+console.log(`✅ DUEL_HOST=${DUEL_HOST} DUEL_PORT=${DUEL_PORT}`);
 
 // Estado
 const clients = new Map();
@@ -71,6 +90,7 @@ function cleanupClient(ws) {
       if (otherC) otherC.matchId = null;
     }
   }
+
   clients.delete(ws);
 }
 
@@ -100,15 +120,19 @@ function tryMatch(roomId) {
 
   matches.set(matchId, { p1, p2, roomId, rps: {} });
 
+  // found
   send(p1, { type: "VIEW", view: "found" });
   send(p2, { type: "VIEW", view: "found" });
 
+  // ✅ manda host/porta pro launcher (mesmo que ainda não exista duel server real)
+  // quando você tiver duel server real, configure DUEL_HOST/DUEL_PORT.
   send(p1, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host: "AUTO",
-    port: 0,
+    host: DUEL_HOST,
+    port: DUEL_PORT,
+    pass: DUEL_PASS,
     you: { userId: c1.userId, username: c1.username },
     opponent: { userId: c2.userId, username: c2.username }
   });
@@ -117,12 +141,14 @@ function tryMatch(roomId) {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host: "AUTO",
-    port: 0,
+    host: DUEL_HOST,
+    port: DUEL_PORT,
+    pass: DUEL_PASS,
     you: { userId: c2.userId, username: c2.username },
     opponent: { userId: c1.userId, username: c1.username }
   });
 
+  // RPS
   send(p1, { type: "VIEW", view: "rps" });
   send(p2, { type: "VIEW", view: "rps" });
 }
@@ -139,7 +165,12 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (buf) => {
     let msg = null;
-    try { msg = JSON.parse(buf.toString()); } catch {}
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
+
     if (!msg?.type) return;
 
     const c = clients.get(ws);
@@ -194,7 +225,11 @@ wss.on("connection", (ws) => {
 
       if (have1 && have2) {
         broadcastMatch(c.matchId, { type: "VIEW", view: "duel" });
-        broadcastMatch(c.matchId, { type: "DUEL_READY", matchId: c.matchId, roomId: match.roomId });
+        broadcastMatch(c.matchId, {
+          type: "DUEL_READY",
+          matchId: c.matchId,
+          roomId: match.roomId
+        });
       }
     }
   });
@@ -204,7 +239,7 @@ wss.on("connection", (ws) => {
 });
 
 // ping keepalive
-setInterval(() => {
+const pingInterval = setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState === WebSocket.OPEN) {
       try { ws.ping(); } catch {}
@@ -212,6 +247,26 @@ setInterval(() => {
   }
 }, 25000);
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Listening on 0.0.0.0:${PORT}`);
+// logs de erro
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+// shutdown limpo
+function shutdown() {
+  console.log("🛑 SIGTERM recebido, encerrando...");
+  clearInterval(pingInterval);
+
+  try { wss.close(); } catch {}
+  try {
+    server.close(() => process.exit(0));
+  } catch {}
+
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+server.listen(PORT, HOST, () => {
+  console.log(`✅ Listening on ${HOST}:${PORT}`);
 });
