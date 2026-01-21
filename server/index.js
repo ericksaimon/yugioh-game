@@ -1,18 +1,26 @@
+const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
 
-// ✅ Railway fornece PORT automaticamente
 const PORT = process.env.PORT || 3001;
-const wss = new WebSocket.Server({ port: PORT });
 
-console.log(`✅ WS Server rodando na porta ${PORT}`);
+// HTTP server (Railway healthcheck)
+const server = http.createServer((req, res) => {
+  if (req.url === "/" || req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK");
+    return;
+  }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
+});
 
-// -------------------- Estado em memória --------------------
-/**
- * clients: ws -> { userId, username, roomId, matchId }
- * queueByRoom: roomId -> [ws, ws, ...]
- * matches: matchId -> { p1: ws, p2: ws, roomId, rps: {key: choice} }
- */
+// WebSocket em cima do mesmo HTTP server
+const wss = new WebSocket.Server({ server });
+
+console.log(`✅ HTTP+WS iniciando... PORT=${PORT}`);
+
+// Estado
 const clients = new Map();
 const queueByRoom = new Map();
 const matches = new Map();
@@ -48,10 +56,8 @@ function cleanupClient(ws) {
   const c = clients.get(ws);
   if (!c) return;
 
-  // remove de fila
   removeFromQueues(ws);
 
-  // se estava em match, avisa o outro
   if (c.matchId) {
     const m = matches.get(c.matchId);
     if (m) {
@@ -65,14 +71,13 @@ function cleanupClient(ws) {
       if (otherC) otherC.matchId = null;
     }
   }
-
   clients.delete(ws);
 }
 
 function tryMatch(roomId) {
   const q = ensureQueue(roomId);
 
-  // remove sockets mortos da fila
+  // remove mortos
   for (let i = q.length - 1; i >= 0; i--) {
     if (!q[i] || q[i].readyState !== WebSocket.OPEN) q.splice(i, 1);
   }
@@ -87,7 +92,6 @@ function tryMatch(roomId) {
   const c2 = clients.get(p2);
   if (!c1 || !c2) return;
 
-  // ✅ não permite se um dos dois já estiver em match
   if (c1.matchId || c2.matchId) return;
 
   const matchId = randomUUID();
@@ -96,22 +100,15 @@ function tryMatch(roomId) {
 
   matches.set(matchId, { p1, p2, roomId, rps: {} });
 
-  // ✅ envia match encontrado (e o front decide ir pro RPS)
   send(p1, { type: "VIEW", view: "found" });
   send(p2, { type: "VIEW", view: "found" });
-
-  // ⚠️ host/port do EDOPro:
-  // No Railway você normalmente só tem 1 porta pública.
-  // Aqui deixamos placeholders e depois você vai apontar pro seu "DuelHost" real.
-  const host = process.env.DUEL_HOST || "AUTO";
-  const port = Number(process.env.DUEL_PORT || 0);
 
   send(p1, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host,
-    port,
+    host: "AUTO",
+    port: 0,
     you: { userId: c1.userId, username: c1.username },
     opponent: { userId: c2.userId, username: c2.username }
   });
@@ -120,16 +117,17 @@ function tryMatch(roomId) {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host,
-    port,
+    host: "AUTO",
+    port: 0,
     you: { userId: c2.userId, username: c2.username },
     opponent: { userId: c1.userId, username: c1.username }
   });
+
+  send(p1, { type: "VIEW", view: "rps" });
+  send(p2, { type: "VIEW", view: "rps" });
 }
 
 wss.on("connection", (ws) => {
-  console.log("Cliente conectado");
-
   clients.set(ws, {
     userId: null,
     username: "Duelista",
@@ -137,20 +135,16 @@ wss.on("connection", (ws) => {
     matchId: null
   });
 
-  // estado inicial compatível
-  send(ws, { type: "AUTH_OK" });
   send(ws, { type: "VIEW", view: "lobby" });
 
   ws.on("message", (buf) => {
-    const raw = buf.toString();
     let msg = null;
-    try { msg = JSON.parse(raw); } catch {}
+    try { msg = JSON.parse(buf.toString()); } catch {}
     if (!msg?.type) return;
 
     const c = clients.get(ws);
     if (!c) return;
 
-    // ------------------ SET_USER ------------------
     if (msg.type === "SET_USER") {
       c.userId = msg.userId || c.userId;
       c.username = msg.username || "Duelista";
@@ -159,8 +153,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ------------------ FIND_MATCH ------------------
-    if (msg.type === "FIND_MATCH") {
+    if (msg.type === "FIND_MATCH" || msg.type === "MATCHMAKE") {
       const roomId = msg.roomId || "random_free";
       c.roomId = roomId;
 
@@ -176,7 +169,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ------------------ CANCEL ------------------
     if (msg.type === "CANCEL_MATCHMAKE") {
       removeFromQueues(ws);
       c.roomId = null;
@@ -184,7 +176,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ------------------ RPS ------------------
     if (msg.type === "RPS") {
       if (!c.matchId) return;
 
@@ -205,21 +196,14 @@ wss.on("connection", (ws) => {
         broadcastMatch(c.matchId, { type: "VIEW", view: "duel" });
         broadcastMatch(c.matchId, { type: "DUEL_READY", matchId: c.matchId, roomId: match.roomId });
       }
-      return;
     }
   });
 
-  ws.on("close", () => {
-    console.log("Cliente desconectado");
-    cleanupClient(ws);
-  });
-
-  ws.on("error", () => {
-    cleanupClient(ws);
-  });
+  ws.on("close", () => cleanupClient(ws));
+  ws.on("error", () => cleanupClient(ws));
 });
 
-// ✅ Keep-alive
+// ping keepalive
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -227,3 +211,7 @@ setInterval(() => {
     }
   }
 }, 25000);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Listening on 0.0.0.0:${PORT}`);
+});
