@@ -1,18 +1,21 @@
-# --- build mínimo do servidor WS/HTTP ---
+# --- Build ---
 FROM node:20-alpine
 
 WORKDIR /app
 
-# Copia só o package do server e instala deps
+# instala deps do server
 COPY server/package*.json ./server/
 RUN cd server && npm ci --omit=dev
 
-# Copia o código do server
-COPY server ./server
+# copia o resto do projeto
+COPY . .
+
+# entra no server
+WORKDIR /app/server
 
 ENV NODE_ENV=production
 ENV PORT=8080
 
 EXPOSE 8080
 
-CMD ["node", "server/index.js"]
+CMD ["node", "index.js"]
