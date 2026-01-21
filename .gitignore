@@ -1,8 +1,11 @@
-﻿# ===== segredos =====
+﻿# ===== segredos / credenciais =====
 .env
 server/firebase-admin.json
+server/firebase-admin*.json
 *.pem
 *.key
+*.p12
+*.pfx
 
 # ===== node =====
 node_modules/
@@ -14,6 +17,7 @@ EDOPro/
 Multirole/
 ocgcore/
 
+*.exe
 server/duel/*.exe
 server/duel/*.dll
 server/duel/*.so
@@ -21,12 +25,6 @@ server/duel/*.dylib
 server/duel/*.bin
 server/duel/*.dat
 
-# ===== logs / temp =====
+# ===== logs / temporários =====
 *.log
 tmp/
-
-server/firebase-admin.json
-.env
-*.key
-*.pem
-
