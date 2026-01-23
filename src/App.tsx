@@ -178,23 +178,33 @@ const App: React.FC = () => {
       if (!msg || !msg.type) return;
 
       if (msg.type === "VIEW") {
-        const v = (msg.view as View) || "lobby";
+  // ✅ pega a view como string (server pode mandar qualquer coisa)
+  const rawView = String(msg.view || "lobby");
 
-        // ✅ não deixa o server tirar a tela FOUND imediatamente
-        if (v === "duel") {
-          const now = Date.now();
-          if (now < blockDuelViewUntilRef.current) {
-            console.log("⛔ Ignorando VIEW=duel (bloqueado temporariamente)");
-            return;
-          }
-        }
+  // ✅ converte só se estiver na whitelist
+  const allowedViews: View[] = ["auth", "lobby", "searching", "found", "error", "duel"];
+  const v: View | null = allowedViews.includes(rawView as View) ? (rawView as View) : null;
 
-        // só troca pra lobby/searching/error
-        if (v === "lobby" || v === "searching" || v === "error" || v === "found" || v === "auth") {
-          setView(v as View);
-        }
-        return;
-      }
+  // se veio coisa estranha do servidor, ignora
+  if (!v) return;
+
+  // ✅ não deixa o server tirar a tela FOUND imediatamente
+  if (v === "duel") {
+    const now = Date.now();
+    if (now < blockDuelViewUntilRef.current) {
+      console.log("⛔ Ignorando VIEW=duel (bloqueado temporariamente)");
+      return;
+    }
+  }
+
+  // só troca pra lobby/searching/error/found/auth (duel a UI não usa)
+  if (v === "lobby" || v === "searching" || v === "error" || v === "found" || v === "auth") {
+    setView(v);
+  }
+
+  return;
+}
+
 
       if (msg.type === "ERROR") {
         setErr(msg.message || "Erro desconhecido.");
@@ -308,14 +318,23 @@ const App: React.FC = () => {
   };
 
   const logout = async () => {
-    try {
-      await signOut(auth);
-      didAuthWsRef.current = false;
-      setMatch(null);
-      localStorage.removeItem(LS_ACTIVE_MATCH);
-      setView("auth");
-    } catch {}
-  };
+  try {
+    // ✅ cancela busca e limpa estado antes
+    sendWS({ type: "CANCEL_MATCHMAKE" });
+
+    didAuthWsRef.current = false;
+    setMatch(null);
+    localStorage.removeItem(LS_ACTIVE_MATCH);
+    setErr(null);
+
+    await signOut(auth);
+
+    // ✅ força estado local imediatamente
+    setIsLogged(false);
+    setView("auth");
+  } catch {}
+};
+
 
   const activeMatchId = localStorage.getItem(LS_ACTIVE_MATCH) || "";
 

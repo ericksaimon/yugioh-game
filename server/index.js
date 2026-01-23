@@ -19,6 +19,14 @@ const DUEL_HOST = process.env.DUEL_HOST || DEFAULT_PUBLIC_HOST;
 const DUEL_PORT = Number(process.env.DUEL_PORT || 7911);
 const DUEL_PASS = process.env.DUEL_PASS || "";
 
+// ✅ CHANGE: controla se a key é "one-time" ou "reusable até expirar"
+// - Para permitir reentrar e evitar 401 por retries, o padrão agora é REUSABLE.
+// - Se você quiser voltar ao modo antigo (one-time), seta env JOIN_KEY_ONE_TIME=true
+const JOIN_KEY_ONE_TIME = String(process.env.JOIN_KEY_ONE_TIME || "false").toLowerCase() === "true";
+
+// ✅ CHANGE: TTL padrão maior (rejoin é útil). Você pode ajustar por env.
+const JOIN_KEY_TTL_MS = Number(process.env.JOIN_KEY_TTL_MS || 30 * 60_000); // 30 min
+
 // ====================== SUPABASE ======================
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRole = process.env.SUPABASE_SERVICE_ROLE;
@@ -52,13 +60,13 @@ async function dbUpsertMatch({ matchId, roomId, p1uid, p2uid }) {
   // guarda match para rejoin sobreviver restart
   const payload = {
     id: matchId,
-    room_id: roomId || "match",
+    room_id: String(roomId || "match"), // ✅ CHANGE: antes você tava passando matchId no lugar do roomId
     p1_uid: String(p1uid || ""),
     p2_uid: String(p2uid || ""),
     duel_host: DUEL_HOST,
     duel_port: DUEL_PORT,
     duel_pass: DUEL_PASS,
-    status: "ready",
+    status: "running", // ✅ CHANGE: "running" fica mais correto pra rejoin
     updated_at: new Date().toISOString(),
   };
 
@@ -66,7 +74,32 @@ async function dbUpsertMatch({ matchId, roomId, p1uid, p2uid }) {
   if (error) console.warn("⚠️ upsert matches failed:", error.message);
 }
 
-async function dbPutJoinKey(matchId, userId, rawKey, ttlMs = 10 * 60_000) {
+async function dbCheckJoinKey(matchId, userId, rawKey) {
+  const { data, error } = await supabase
+    .from("match_join_keys")
+    .select("key_hash, expires_at")
+    .eq("match_id", matchId)
+    .eq("user_id", String(userId))
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: "db_error" };
+  if (!data) return { ok: false, reason: "missing" };
+
+  const exp = new Date(data.expires_at).getTime();
+  if (Date.now() > exp) return { ok: false, reason: "expired" };
+
+  const providedHex = hashKeyHex(rawKey);
+  const a = hashKeyBufFromHex(providedHex);
+  const b = hashKeyBufFromHex(data.key_hash);
+
+  if (a.length !== b.length) return { ok: false, reason: "bad_len" };
+  const ok = timingSafeEqual(a, b);
+
+  return ok ? { ok: true } : { ok: false, reason: "bad" };
+}
+
+
+async function dbPutJoinKey(matchId, userId, rawKey, ttlMs = JOIN_KEY_TTL_MS) {
   const expiresAt = new Date(Date.now() + ttlMs).toISOString();
   const keyHash = hashKeyHex(rawKey);
 
@@ -83,6 +116,11 @@ async function dbPutJoinKey(matchId, userId, rawKey, ttlMs = 10 * 60_000) {
   if (error) console.warn("⚠️ upsert match_join_keys failed:", error.message);
 }
 
+// ✅ CHANGE: agora valida SEMPRE pelo DB e NÃO consome por padrão (reusable até expirar)
+// Isso evita:
+// - 401 por retry de rede
+// - 401 porque abriu/fechou launcher e tentou de novo
+// - dá suporte ao REJOIN real
 async function dbConsumeJoinKey(matchId, userId, rawKey) {
   // 1) tenta DB (principal)
   const { data, error } = await supabase
@@ -97,7 +135,9 @@ async function dbConsumeJoinKey(matchId, userId, rawKey) {
 
   const exp = new Date(data.expires_at).getTime();
   if (Date.now() > exp) {
+    // expirou -> remove
     await supabase.from("match_join_keys").delete().eq("match_id", matchId).eq("user_id", String(userId));
+    joinKeys.delete(`${matchId}:${userId}`);
     return { ok: false, reason: "expired" };
   }
 
@@ -107,12 +147,14 @@ async function dbConsumeJoinKey(matchId, userId, rawKey) {
 
   if (a.length !== b.length) return { ok: false, reason: "bad_len" };
   const ok = timingSafeEqual(a, b);
-
   if (!ok) return { ok: false, reason: "bad" };
 
-  // one-time (mantém seu modelo de segurança)
-  await supabase.from("match_join_keys").delete().eq("match_id", matchId).eq("user_id", String(userId));
-  joinKeys.delete(`${matchId}:${userId}`);
+  // ✅ CHANGE: NÃO deletar por padrão (rejoin)
+  // Se quiser "one-time key", habilita env JOIN_KEY_ONE_TIME=true
+  if (JOIN_KEY_ONE_TIME) {
+    await supabase.from("match_join_keys").delete().eq("match_id", matchId).eq("user_id", String(userId));
+    joinKeys.delete(`${matchId}:${userId}`);
+  }
 
   return { ok: true };
 }
@@ -164,7 +206,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: "missing matchId/userId/key" }));
       }
 
-      // ✅ valida e consome joinKey (agora vem do DB e sobrevive restart)
+      // ✅ valida (agora sem consumir por padrão)
       const keyCheck = await dbConsumeJoinKey(matchId, userId, key);
       if (!keyCheck.ok) {
         res.writeHead(401, { "Content-Type": "application/json" });
@@ -229,20 +271,23 @@ const server = http.createServer(async (req, res) => {
 
       const duelHost = (dbMatch?.duel_host || DUEL_HOST);
       const duelPort = Number(dbMatch?.duel_port || DUEL_PORT);
-      const duelPass = (dbMatch?.duel_pass ?? DUEL_PASS) || "";
+      const duelPass = String(dbMatch?.duel_pass ?? DUEL_PASS ?? "");
+
 
       const payload = {
         match: {
-          id: matchId,
-          duelHost,
-          duelPort,
-          room: roomId,
-          pass: duelPass,
-          status: dbMatch?.status || "ready",
+        id: matchId,
+        duelHost,
+        duelPort,
+        room: roomId,
+        roomId: roomId, // ✅ compat extra para alguns launchers
+        pass: duelPass,
+        status: dbMatch?.status || "running",
         },
+
         you: {
-          id: profile?.id || userId,
-          username: profile?.username || "Duelista",
+          id: String(profile?.id || userId),
+          username: String(profile?.username || "Duelista"),
           teamTag: profile?.team_tag || "",
           level: profile?.level ?? 1,
           avatarUrl: profile?.avatar_url || "",
@@ -255,6 +300,11 @@ const server = http.createServer(async (req, res) => {
           userId: opponentUserId || "",
           username: "",
         },
+        // ✅ CHANGE: ajuda debug no launcher sem quebrar nada
+        meta: {
+          joinKeyOneTime: JOIN_KEY_ONE_TIME,
+          joinKeyTtlMs: JOIN_KEY_TTL_MS,
+        }
       };
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -344,19 +394,23 @@ async function tryMatch(roomId) {
   matches.set(matchId, { p1, p2, roomId });
 
   // ✅ salva match no DB (novo)
-  await dbUpsertMatch({ matchId, roomId: matchId, p1uid: c1.userId, p2uid: c2.userId });
+  // ✅ CHANGE: agora roomId correto
+  await dbUpsertMatch({ matchId, roomId, p1uid: c1.userId, p2uid: c2.userId });
 
   // cria joinKey por jogador (agora salva no DB)
   const key1 = makeJoinKey();
   const key2 = makeJoinKey();
-  await dbPutJoinKey(matchId, c1.userId, key1, 10 * 60_000);
-  await dbPutJoinKey(matchId, c2.userId, key2, 10 * 60_000);
+  await dbPutJoinKey(matchId, c1.userId, key1, JOIN_KEY_TTL_MS); // ✅ CHANGE TTL
+  await dbPutJoinKey(matchId, c2.userId, key2, JOIN_KEY_TTL_MS); // ✅ CHANGE TTL
+
+  // ✅ CHANGE: api deve bater com o que o launcher usa
+  const apiBase = `https://${DEFAULT_PUBLIC_HOST}`;
 
   send(p1, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    api: `https://${DEFAULT_PUBLIC_HOST}`,
+    api: apiBase,
     joinKey: key1,
     you: { userId: c1.userId, username: c1.username },
     opponent: { userId: c2.userId, username: c2.username },
@@ -366,7 +420,7 @@ async function tryMatch(roomId) {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    api: `https://${DEFAULT_PUBLIC_HOST}`,
+    api: apiBase,
     joinKey: key2,
     you: { userId: c2.userId, username: c2.username },
     opponent: { userId: c1.userId, username: c1.username },
@@ -442,14 +496,14 @@ wss.on("connection", (ws) => {
 
       // gera joinKey nova (renovável)
       const newKey = makeJoinKey();
-      await dbPutJoinKey(matchId, c.userId, newKey, 10 * 60_000);
+      await dbPutJoinKey(matchId, c.userId, newKey, JOIN_KEY_TTL_MS); // ✅ CHANGE TTL
 
       send(ws, {
         type: "JOIN_KEY",
         matchId,
         api: `https://${DEFAULT_PUBLIC_HOST}`,
         joinKey: newKey,
-        roomId: "random_free", // não é vital aqui
+        roomId: dbMatch.room_id || "random_free",
         you: { userId: c.userId, username: c.username },
       });
       return;
@@ -473,4 +527,5 @@ server.listen(PORT, HOST, () => {
   console.log(`✅ HTTP+WS iniciando... HOST=${HOST} PORT=${PORT}`);
   console.log(`✅ DUEL_HOST=${DUEL_HOST} DUEL_PORT=${DUEL_PORT}`);
   console.log(`✅ Listening on ${HOST}:${PORT}`);
+  console.log(`✅ JOIN_KEY_ONE_TIME=${JOIN_KEY_ONE_TIME} TTL_MS=${JOIN_KEY_TTL_MS}`); // ✅ CHANGE
 });
