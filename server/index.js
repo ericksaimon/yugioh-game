@@ -1,59 +1,280 @@
-const http = require("http");
-const WebSocket = require("ws");
-const { randomUUID } = require("crypto");
+"use strict";
 
-// ✅ Fly usa internal_port=8080 no proxy.
-// Em muitos casos o Fly injeta PORT=8080.
-// Se não injetar, a gente FORÇA 8080 como padrão (não 3001).
+const http = require("http");
+const { URL } = require("url");
+const WebSocket = require("ws");
+const { randomUUID, randomBytes, timingSafeEqual, createHash } = require("crypto");
+
+const { createClient } = require("@supabase/supabase-js");
+
+// ====================== ENV / PORT ======================
 const PORT = Number(process.env.PORT || 8080);
 const HOST = "0.0.0.0";
 
-// ✅ Se você quiser mandar um host/porta real pro launcher (quando tiver duel server),
-// configure no Fly Secrets/Env:
-// DUEL_HOST = "seu-duelhost.fly.dev" (ou domínio/IP)
-// DUEL_PORT = "7911"
-const DEFAULT_PUBLIC_HOST = process.env.PUBLIC_HOST || process.env.FLY_APP_NAME
-  ? `${process.env.FLY_APP_NAME}.fly.dev`
-  : "localhost";
+const DEFAULT_PUBLIC_HOST =
+  process.env.PUBLIC_HOST ||
+  (process.env.FLY_APP_NAME ? `${process.env.FLY_APP_NAME}.fly.dev` : "localhost");
 
 const DUEL_HOST = process.env.DUEL_HOST || DEFAULT_PUBLIC_HOST;
 const DUEL_PORT = Number(process.env.DUEL_PORT || 7911);
-const DUEL_PASS = ""; // sem senha como você quer
+const DUEL_PASS = process.env.DUEL_PASS || "";
 
-// HTTP server (healthcheck + fallback)
-const server = http.createServer((req, res) => {
-  // responde OK para healthcheck e rota raiz
-  if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("OK");
-  }
+// ====================== SUPABASE ======================
+const supabaseUrl = process.env.SUPABASE_URL;
+const serviceRole = process.env.SUPABASE_SERVICE_ROLE;
 
-  // fallback 200 (evita proxy/health reclamar por 404)
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("OK");
+if (!supabaseUrl || !serviceRole) {
+  throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE faltando no env");
+}
+
+const supabase = createClient(supabaseUrl, serviceRole, {
+  auth: { persistSession: false },
 });
 
-// WebSocket em cima do mesmo HTTP server
+// ====================== IN-MEMORY STORE (mantido) ======================
+const joinKeys = new Map(); // cache opcional (não depende mais dele)
+const clients = new Map();     // ws -> { userId, username, roomId, matchId }
+const queueByRoom = new Map(); // roomId -> [ws, ws]
+const matches = new Map();     // matchId -> { p1, p2, roomId }
+
+function makeJoinKey() {
+  return randomBytes(16).toString("base64url");
+}
+function hashKeyHex(key) {
+  return createHash("sha256").update(key).digest("hex");
+}
+function hashKeyBufFromHex(hex) {
+  return Buffer.from(hex, "hex");
+}
+
+// ====================== DB HELPERS (NOVO) ======================
+async function dbUpsertMatch({ matchId, roomId, p1uid, p2uid }) {
+  // guarda match para rejoin sobreviver restart
+  const payload = {
+    id: matchId,
+    room_id: roomId || "match",
+    p1_uid: String(p1uid || ""),
+    p2_uid: String(p2uid || ""),
+    duel_host: DUEL_HOST,
+    duel_port: DUEL_PORT,
+    duel_pass: DUEL_PASS,
+    status: "ready",
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error } = await supabase.from("matches").upsert(payload, { onConflict: "id" });
+  if (error) console.warn("⚠️ upsert matches failed:", error.message);
+}
+
+async function dbPutJoinKey(matchId, userId, rawKey, ttlMs = 10 * 60_000) {
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const keyHash = hashKeyHex(rawKey);
+
+  // mantém cache local (não é obrigatório)
+  joinKeys.set(`${matchId}:${userId}`, { keyHash: hashKeyBufFromHex(keyHash), expiresAt: Date.now() + ttlMs });
+
+  const { error } = await supabase
+    .from("match_join_keys")
+    .upsert(
+      { match_id: matchId, user_id: String(userId), key_hash: keyHash, expires_at: expiresAt },
+      { onConflict: "match_id,user_id" }
+    );
+
+  if (error) console.warn("⚠️ upsert match_join_keys failed:", error.message);
+}
+
+async function dbConsumeJoinKey(matchId, userId, rawKey) {
+  // 1) tenta DB (principal)
+  const { data, error } = await supabase
+    .from("match_join_keys")
+    .select("key_hash, expires_at")
+    .eq("match_id", matchId)
+    .eq("user_id", String(userId))
+    .maybeSingle();
+
+  if (error) return { ok: false, reason: "db_error" };
+  if (!data) return { ok: false, reason: "missing" };
+
+  const exp = new Date(data.expires_at).getTime();
+  if (Date.now() > exp) {
+    await supabase.from("match_join_keys").delete().eq("match_id", matchId).eq("user_id", String(userId));
+    return { ok: false, reason: "expired" };
+  }
+
+  const providedHex = hashKeyHex(rawKey);
+  const a = hashKeyBufFromHex(providedHex);
+  const b = hashKeyBufFromHex(data.key_hash);
+
+  if (a.length !== b.length) return { ok: false, reason: "bad_len" };
+  const ok = timingSafeEqual(a, b);
+
+  if (!ok) return { ok: false, reason: "bad" };
+
+  // one-time (mantém seu modelo de segurança)
+  await supabase.from("match_join_keys").delete().eq("match_id", matchId).eq("user_id", String(userId));
+  joinKeys.delete(`${matchId}:${userId}`);
+
+  return { ok: true };
+}
+
+async function dbGetMatch(matchId) {
+  const { data, error } = await supabase
+    .from("matches")
+    .select("id, room_id, p1_uid, p2_uid, duel_host, duel_port, duel_pass, status")
+    .eq("id", matchId)
+    .maybeSingle();
+
+  if (error) return null;
+  return data || null;
+}
+
+// limpeza de keys expiradas (mantida + agora também limpa no DB)
+setInterval(async () => {
+  const now = Date.now();
+
+  // cache local
+  for (const [k, v] of joinKeys.entries()) {
+    if (now > v.expiresAt) joinKeys.delete(k);
+  }
+
+  // db
+  try {
+    await supabase.from("match_join_keys").delete().lt("expires_at", new Date().toISOString());
+  } catch {}
+}, 60_000).unref();
+
+// ====================== HTTP SERVER (API + health) ======================
+const server = http.createServer(async (req, res) => {
+  try {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+
+    if (u.pathname === "/" || u.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end("OK");
+    }
+
+    // -------- API: /api/match/config --------
+    if (u.pathname === "/api/match/config" && req.method === "GET") {
+      const matchId = (u.searchParams.get("matchId") || "").trim();
+      const userId = (u.searchParams.get("userId") || "").trim();
+      const key = (u.searchParams.get("key") || "").trim();
+
+      if (!matchId || !userId || !key) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "missing matchId/userId/key" }));
+      }
+
+      // ✅ valida e consome joinKey (agora vem do DB e sobrevive restart)
+      const keyCheck = await dbConsumeJoinKey(matchId, userId, key);
+      if (!keyCheck.ok) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "invalid_or_expired_key", reason: keyCheck.reason }));
+      }
+
+      // pega match: tenta memória (mantido), senão DB (novo)
+      let m = matches.get(matchId);
+      let dbMatch = null;
+
+      if (!m) {
+        dbMatch = await dbGetMatch(matchId);
+        if (!dbMatch) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "match_not_found" }));
+        }
+      }
+
+      // determina room e oponentes (melhor esforço)
+      const roomId = (m?.roomId || dbMatch?.room_id || "match");
+
+      // tenta inferir opponent do DB
+      let opponentUserId = "";
+      if (dbMatch) {
+        if (dbMatch.p1_uid === userId) opponentUserId = dbMatch.p2_uid;
+        else if (dbMatch.p2_uid === userId) opponentUserId = dbMatch.p1_uid;
+      } else {
+        const c1 = clients.get(m.p1);
+        const c2 = clients.get(m.p2);
+        const youIsP1 = (c1?.userId === userId);
+        const opp = youIsP1 ? c2 : c1;
+        opponentUserId = opp?.userId || "";
+      }
+
+      // PERFIL
+      const { data: profile, error: pErr } = await supabase
+        .from("profiles")
+        .select("id, username, team_tag, level, avatar_url, wizard_money, equipped_deck_id")
+        .eq("id", userId)
+        .maybeSingle();
+
+      if (pErr) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "profile_query_failed", details: pErr.message }));
+      }
+
+      // DECK
+      let deck = null;
+      if (profile?.equipped_deck_id) {
+        const { data: d, error: dErr } = await supabase
+          .from("decks")
+          .select("id, name, ydk_text")
+          .eq("id", profile.equipped_deck_id)
+          .maybeSingle();
+
+        if (dErr) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "deck_query_failed", details: dErr.message }));
+        }
+        deck = d;
+      }
+
+      const duelHost = (dbMatch?.duel_host || DUEL_HOST);
+      const duelPort = Number(dbMatch?.duel_port || DUEL_PORT);
+      const duelPass = (dbMatch?.duel_pass ?? DUEL_PASS) || "";
+
+      const payload = {
+        match: {
+          id: matchId,
+          duelHost,
+          duelPort,
+          room: roomId,
+          pass: duelPass,
+          status: dbMatch?.status || "ready",
+        },
+        you: {
+          id: profile?.id || userId,
+          username: profile?.username || "Duelista",
+          teamTag: profile?.team_tag || "",
+          level: profile?.level ?? 1,
+          avatarUrl: profile?.avatar_url || "",
+          wizardMoney: profile?.wizard_money ?? 0,
+          equippedDeck: deck
+            ? { id: deck.id, name: deck.name, ydkText: deck.ydk_text }
+            : { id: "", name: "", ydkText: "" },
+        },
+        opponent: {
+          userId: opponentUserId || "",
+          username: "",
+        },
+      };
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify(payload));
+    }
+
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK");
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "text/plain" });
+    res.end("ERR");
+  }
+});
+
+// ====================== WS ======================
 const wss = new WebSocket.Server({ server });
-
-console.log(`✅ HTTP+WS iniciando... HOST=${HOST} PORT=${PORT}`);
-console.log(`✅ DUEL_HOST=${DUEL_HOST} DUEL_PORT=${DUEL_PORT}`);
-
-// Estado
-const clients = new Map();
-const queueByRoom = new Map();
-const matches = new Map();
 
 function send(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify(obj));
-}
-
-function broadcastMatch(matchId, obj) {
-  const m = matches.get(matchId);
-  if (!m) return;
-  send(m.p1, obj);
-  send(m.p2, obj);
 }
 
 function ensureQueue(roomId) {
@@ -83,7 +304,6 @@ function cleanupClient(ws) {
       const other = m.p1 === ws ? m.p2 : m.p1;
       send(other, { type: "MATCH_CANCELLED", reason: "opponent_left" });
       send(other, { type: "VIEW", view: "lobby" });
-
       matches.delete(c.matchId);
 
       const otherC = clients.get(other);
@@ -94,10 +314,9 @@ function cleanupClient(ws) {
   clients.delete(ws);
 }
 
-function tryMatch(roomId) {
+async function tryMatch(roomId) {
   const q = ensureQueue(roomId);
 
-  // remove mortos
   for (let i = q.length - 1; i >= 0; i--) {
     if (!q[i] || q[i].readyState !== WebSocket.OPEN) q.splice(i, 1);
   }
@@ -112,65 +331,58 @@ function tryMatch(roomId) {
   const c2 = clients.get(p2);
   if (!c1 || !c2) return;
 
-  if (c1.matchId || c2.matchId) return;
+  if (!c1.userId || !c2.userId) {
+    send(p1, { type: "ERROR", message: "SET_USER required" });
+    send(p2, { type: "ERROR", message: "SET_USER required" });
+    return;
+  }
 
   const matchId = randomUUID();
   c1.matchId = matchId;
   c2.matchId = matchId;
 
-  matches.set(matchId, { p1, p2, roomId, rps: {} });
+  matches.set(matchId, { p1, p2, roomId });
 
-  // found
-  send(p1, { type: "VIEW", view: "found" });
-  send(p2, { type: "VIEW", view: "found" });
+  // ✅ salva match no DB (novo)
+  await dbUpsertMatch({ matchId, roomId: matchId, p1uid: c1.userId, p2uid: c2.userId });
 
-  // ✅ manda host/porta pro launcher (mesmo que ainda não exista duel server real)
-  // quando você tiver duel server real, configure DUEL_HOST/DUEL_PORT.
+  // cria joinKey por jogador (agora salva no DB)
+  const key1 = makeJoinKey();
+  const key2 = makeJoinKey();
+  await dbPutJoinKey(matchId, c1.userId, key1, 10 * 60_000);
+  await dbPutJoinKey(matchId, c2.userId, key2, 10 * 60_000);
+
   send(p1, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host: DUEL_HOST,
-    port: DUEL_PORT,
-    pass: DUEL_PASS,
+    api: `https://${DEFAULT_PUBLIC_HOST}`,
+    joinKey: key1,
     you: { userId: c1.userId, username: c1.username },
-    opponent: { userId: c2.userId, username: c2.username }
+    opponent: { userId: c2.userId, username: c2.username },
   });
 
   send(p2, {
     type: "MATCH_FOUND",
     matchId,
     roomId,
-    host: DUEL_HOST,
-    port: DUEL_PORT,
-    pass: DUEL_PASS,
+    api: `https://${DEFAULT_PUBLIC_HOST}`,
+    joinKey: key2,
     you: { userId: c2.userId, username: c2.username },
-    opponent: { userId: c1.userId, username: c1.username }
+    opponent: { userId: c1.userId, username: c1.username },
   });
 
-  // RPS
-  send(p1, { type: "VIEW", view: "rps" });
-  send(p2, { type: "VIEW", view: "rps" });
+  send(p1, { type: "VIEW", view: "duel" });
+  send(p2, { type: "VIEW", view: "duel" });
 }
 
 wss.on("connection", (ws) => {
-  clients.set(ws, {
-    userId: null,
-    username: "Duelista",
-    roomId: null,
-    matchId: null
-  });
-
+  clients.set(ws, { userId: null, username: "Duelista", roomId: null, matchId: null });
   send(ws, { type: "VIEW", view: "lobby" });
 
-  ws.on("message", (buf) => {
-    let msg = null;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
+  ws.on("message", async (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
     if (!msg?.type) return;
 
     const c = clients.get(ws);
@@ -196,7 +408,7 @@ wss.on("connection", (ws) => {
       const q = ensureQueue(roomId);
       if (!q.includes(ws)) q.push(ws);
 
-      tryMatch(roomId);
+      await tryMatch(roomId);
       return;
     }
 
@@ -207,30 +419,40 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "RPS") {
-      if (!c.matchId) return;
-
-      const match = matches.get(c.matchId);
-      if (!match) return;
-
-      const key = c.userId || c.username;
-      match.rps[key] = msg.choice;
-
-      const c1 = clients.get(match.p1);
-      const c2 = clients.get(match.p2);
-      if (!c1 || !c2) return;
-
-      const have1 = match.rps[c1.userId || c1.username];
-      const have2 = match.rps[c2.userId || c2.username];
-
-      if (have1 && have2) {
-        broadcastMatch(c.matchId, { type: "VIEW", view: "duel" });
-        broadcastMatch(c.matchId, {
-          type: "DUEL_READY",
-          matchId: c.matchId,
-          roomId: match.roomId
-        });
+    // ✅ NOVO: pedir joinKey pra rejoin
+    if (msg.type === "REQUEST_JOIN_KEY") {
+      const matchId = (msg.matchId || "").trim();
+      if (!matchId || !c.userId) {
+        send(ws, { type: "ERROR", message: "REQUEST_JOIN_KEY missing matchId/userId" });
+        return;
       }
+
+      const dbMatch = await dbGetMatch(matchId);
+      if (!dbMatch) {
+        send(ws, { type: "ERROR", message: "match_not_found" });
+        return;
+      }
+
+      // garante que esse user faz parte do match
+      const okMember = (dbMatch.p1_uid === c.userId || dbMatch.p2_uid === c.userId);
+      if (!okMember) {
+        send(ws, { type: "ERROR", message: "not_in_match" });
+        return;
+      }
+
+      // gera joinKey nova (renovável)
+      const newKey = makeJoinKey();
+      await dbPutJoinKey(matchId, c.userId, newKey, 10 * 60_000);
+
+      send(ws, {
+        type: "JOIN_KEY",
+        matchId,
+        api: `https://${DEFAULT_PUBLIC_HOST}`,
+        joinKey: newKey,
+        roomId: "random_free", // não é vital aqui
+        you: { userId: c.userId, username: c.username },
+      });
+      return;
     }
   });
 
@@ -238,35 +460,17 @@ wss.on("connection", (ws) => {
   ws.on("error", () => cleanupClient(ws));
 });
 
-// ping keepalive
-const pingInterval = setInterval(() => {
+// keepalive
+setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState === WebSocket.OPEN) {
       try { ws.ping(); } catch {}
     }
   }
-}, 25000);
-
-// logs de erro
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
-
-// shutdown limpo
-function shutdown() {
-  console.log("🛑 SIGTERM recebido, encerrando...");
-  clearInterval(pingInterval);
-
-  try { wss.close(); } catch {}
-  try {
-    server.close(() => process.exit(0));
-  } catch {}
-
-  setTimeout(() => process.exit(0), 5000).unref();
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+}, 25000).unref();
 
 server.listen(PORT, HOST, () => {
+  console.log(`✅ HTTP+WS iniciando... HOST=${HOST} PORT=${PORT}`);
+  console.log(`✅ DUEL_HOST=${DUEL_HOST} DUEL_PORT=${DUEL_PORT}`);
   console.log(`✅ Listening on ${HOST}:${PORT}`);
 });

@@ -1,9 +1,6 @@
 app = "yugioh-game-ws-erick-01"
 primary_region = "ams"
 
-[build]
-  dockerfile = "Dockerfile"
-
 [env]
   PORT = "8080"
   NODE_ENV = "production"
@@ -14,8 +11,3 @@ primary_region = "ams"
   auto_start_machines = true
   auto_stop_machines = false
   min_machines_running = 1
-
-  [http_service.concurrency]
-    type = "connections"
-    soft_limit = 25
-    hard_limit = 50

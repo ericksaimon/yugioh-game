@@ -1,83 +1,129 @@
-type WSGlobal = Window & {
-  __YGO_WS__?: WebSocket;
-  __YGO_WS_CONNECTING__?: boolean;
-  __YGO_WS_QUEUE__?: string[];
-};
+// src/ws.ts
 
-const getWsUrl = () => {
-  // Use no .env:
-  // VITE_WS_URL=ws://localhost:3001
-  // ou
-  // VITE_WS_URL=wss://SEU-PROJETO.up.railway.app
-  const url = import.meta.env.VITE_WS_URL as string | undefined;
-  return (url && url.trim()) ? url.trim() : "ws://localhost:3001";
-};
+type WSHandler = (data: any) => void;
 
-export function connectWS(onMessage: (msg: any) => void) {
-  const w = window as WSGlobal;
+let ws: WebSocket | null = null;
+let handler: WSHandler | null = null;
 
-  // se já existe socket vivo, não cria outro
-  if (
-    w.__YGO_WS__ &&
-    (w.__YGO_WS__.readyState === WebSocket.OPEN ||
-      w.__YGO_WS__.readyState === WebSocket.CONNECTING)
-  ) {
+let isConnecting = false;
+let reconnectAttempts = 0;
+let reconnectTimer: number | null = null;
+let heartbeatTimer: number | null = null;
+let sendQueue: any[] = [];
+
+const MAX_RECONNECT_DELAY = 10000;
+
+// Resolve URL do WebSocket
+function getWsUrl() {
+  const envUrl = (import.meta as any).env?.VITE_WS_URL as string | undefined;
+  if (envUrl && envUrl.trim()) return envUrl.trim();
+
+  // fallback automático
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}`;
+}
+
+export function connectWS(onMessage: WSHandler) {
+  handler = onMessage;
+
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
-  if (w.__YGO_WS_CONNECTING__) return;
-  w.__YGO_WS_CONNECTING__ = true;
+  if (isConnecting) return;
+  isConnecting = true;
 
   const url = getWsUrl();
-  const socket = new WebSocket(url);
+  console.log("🔌 Connecting WS:", url);
 
-  w.__YGO_WS__ = socket;
-  w.__YGO_WS_QUEUE__ = w.__YGO_WS_QUEUE__ || [];
+  ws = new WebSocket(url);
 
-  socket.onopen = () => {
-    console.log("✅ WS conectado:", url);
-    w.__YGO_WS_CONNECTING__ = false;
+  ws.onopen = () => {
+    console.log("✅ WS connected");
+    isConnecting = false;
+    reconnectAttempts = 0;
 
-    // flush fila
-    const q = w.__YGO_WS_QUEUE__ || [];
-    while (q.length > 0) {
-      const payload = q.shift();
-      if (payload && socket.readyState === WebSocket.OPEN) socket.send(payload);
+    // envia fila pendente
+    for (const msg of sendQueue) {
+      try {
+        ws?.send(JSON.stringify(msg));
+      } catch {}
     }
+    sendQueue = [];
+
+    // inicia heartbeat (mantém conexão viva em VPS)
+    startHeartbeat();
   };
 
-  socket.onmessage = (e) => {
-    try {
-      onMessage(JSON.parse(e.data));
-    } catch {
-      onMessage(e.data);
-    }
+  ws.onmessage = (ev) => {
+  if (!handler) return;
+
+  try {
+    const data = JSON.parse(ev.data);
+
+    // opcional: ignore PONG/heartbeat
+    if (data?.type === "PONG") return;
+
+    handler(data);
+  } catch {
+    // se vier texto puro, ainda entrega
+    handler(ev.data);
+  }
+};
+
+
+  ws.onerror = (err) => {
+    console.error("❌ WS error", err);
   };
 
-  socket.onclose = () => {
-    console.log("❌ WS desconectado");
-    if (w.__YGO_WS__ === socket) w.__YGO_WS__ = undefined;
-    w.__YGO_WS_CONNECTING__ = false;
+  ws.onclose = () => {
+    console.warn("🔌 WS closed");
+    isConnecting = false;
+    stopHeartbeat();
 
-    // reconecta em 1.5s
-    setTimeout(() => connectWS(onMessage), 1500);
-  };
+    // backoff exponencial (até 10s)
+    const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY);
+    reconnectAttempts++;
 
-  socket.onerror = (err) => {
-    console.log("⚠️ WS erro", err);
+    console.log(`🔁 Reconnecting in ${delay}ms...`);
+
+    if (reconnectTimer) window.clearTimeout(reconnectTimer);
+    reconnectTimer = window.setTimeout(() => {
+      connectWS(onMessage);
+    }, delay);
   };
 }
 
+// Envia mensagens com segurança
 export function sendWS(obj: any) {
-  const w = window as WSGlobal;
-  const payload = JSON.stringify(obj);
-
-  // se não tem socket, cria um buffer e tenta conectar
-  if (!w.__YGO_WS__ || w.__YGO_WS__.readyState !== WebSocket.OPEN) {
-    w.__YGO_WS_QUEUE__ = w.__YGO_WS_QUEUE__ || [];
-    w.__YGO_WS_QUEUE__!.push(payload);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    sendQueue.push(obj);
     return;
   }
 
-  w.__YGO_WS__.send(payload);
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch (err) {
+    console.error("❌ Failed to send WS message:", err);
+  }
+}
+
+// Heartbeat para manter conexão viva em produção
+function startHeartbeat() {
+  stopHeartbeat();
+
+  heartbeatTimer = window.setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "PING" }));
+      } catch {}
+    }
+  }, 25000);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
 }
