@@ -41,9 +41,9 @@ const supabase = createClient(supabaseUrl, serviceRole, {
 
 // ====================== IN-MEMORY STORE (mantido) ======================
 const joinKeys = new Map(); // cache opcional (não depende mais dele)
-const clients = new Map();     // ws -> { userId, username, roomId, matchId }
+const clients = new Map(); // ws -> { userId, username, roomId, matchId }
 const queueByRoom = new Map(); // roomId -> [ws, ws]
-const matches = new Map();     // matchId -> { p1, p2, roomId }
+const matches = new Map(); // matchId -> { p1, p2, roomId }
 
 function makeJoinKey() {
   return randomBytes(16).toString("base64url");
@@ -97,7 +97,6 @@ async function dbCheckJoinKey(matchId, userId, rawKey) {
 
   return ok ? { ok: true } : { ok: false, reason: "bad" };
 }
-
 
 async function dbPutJoinKey(matchId, userId, rawKey, ttlMs = JOIN_KEY_TTL_MS) {
   const expiresAt = new Date(Date.now() + ttlMs).toISOString();
@@ -170,6 +169,66 @@ async function dbGetMatch(matchId) {
   return data || null;
 }
 
+// ✅ NOVO (sem quebrar): resolve profile com o schema REAL (firebase_uid) e fallback opcional
+// - seu banco: profiles.firebase_uid (text, NOT NULL)
+// - não existe profiles.id / profiles.user_id etc.
+async function fetchProfileByAnyKey(userId) {
+  // a gente tenta primeiro pelo schema real:
+  const selectBase = "firebase_uid, username, team_tag, level, avatar_url, wizard_money";
+
+  // 1) caminho principal (correto pro seu banco)
+  let r = await supabase.from("profiles").select(selectBase).eq("firebase_uid", userId).maybeSingle();
+  if (r.data) return { data: r.data, error: null, matchedCol: "firebase_uid" };
+  if (r.error && !String(r.error.message || "").toLowerCase().includes("does not exist")) {
+    return { data: null, error: r.error, matchedCol: "firebase_uid" };
+  }
+
+  // 2) fallback (mantido “sem quebrar”, caso você mude schema no futuro)
+  const candidates = ["id", "user_id", "uid", "auth_uid", "user_uid", "owner_id"];
+  for (const col of candidates) {
+    const rr = await supabase.from("profiles").select(selectBase).eq(col, userId).maybeSingle();
+
+    if (rr.data) return { data: rr.data, error: null, matchedCol: col };
+
+    // se coluna não existe, tenta próxima
+    if (rr.error && String(rr.error.message || "").toLowerCase().includes("does not exist")) continue;
+
+    // erro real
+    if (rr.error) return { data: null, error: rr.error, matchedCol: col };
+  }
+
+  return { data: null, error: null, matchedCol: null };
+}
+
+// ✅ NOVO (sem quebrar): pega deck equipado do usuário pelo schema REAL
+// - seu banco: decks.firebase_uid + decks.is_equipped + decks.name
+// - não existe decks.ydk_text (por enquanto)
+async function fetchEquippedDeck(userId) {
+  // 1) caminho principal (correto)
+  const r = await supabase
+    .from("decks")
+    .select("id, name, firebase_uid, is_equipped")
+    .eq("firebase_uid", String(userId))
+    .eq("is_equipped", true)
+    .maybeSingle();
+
+  if (r.error) {
+    // se colunas não existirem (futuro), a gente só devolve null sem derrubar
+    if (String(r.error.message || "").toLowerCase().includes("does not exist")) {
+      return { data: null, error: null };
+    }
+    return { data: null, error: r.error };
+  }
+
+  if (!r.data) return { data: null, error: null };
+
+  // mantém o formato que o launcher espera (ydkText pode vir vazio por enquanto)
+  return {
+    data: { id: r.data.id, name: r.data.name, ydkText: "" },
+    error: null,
+  };
+}
+
 // limpeza de keys expiradas (mantida + agora também limpa no DB)
 setInterval(async () => {
   const now = Date.now();
@@ -226,7 +285,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // determina room e oponentes (melhor esforço)
-      const roomId = (m?.roomId || dbMatch?.room_id || "match");
+      const roomId = m?.roomId || dbMatch?.room_id || "match";
 
       // tenta inferir opponent do DB
       let opponentUserId = "";
@@ -236,57 +295,55 @@ const server = http.createServer(async (req, res) => {
       } else {
         const c1 = clients.get(m.p1);
         const c2 = clients.get(m.p2);
-        const youIsP1 = (c1?.userId === userId);
+        const youIsP1 = c1?.userId === userId;
         const opp = youIsP1 ? c2 : c1;
         opponentUserId = opp?.userId || "";
       }
 
-      // PERFIL
+      // ====================== PERFIL (AJUSTADO AO SEU SCHEMA) ======================
       const prof = await fetchProfileByAnyKey(userId);
 
-if (prof.error) {
-  res.writeHead(500, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({ error: "profile_query_failed", details: prof.error.message }));
-}
-
-if (!prof.data) {
-  res.writeHead(404, { "Content-Type": "application/json" });
-  return res.end(JSON.stringify({ error: "profile_not_found", details: "No profile row matched this userId", tried: ["id","user_id","uid","firebase_uid","auth_uid","user_uid","owner_id"] }));
-}
-
-const profile = prof.data;
-
-
-      // DECK
-      let deck = null;
-      if (profile?.equipped_deck_id) {
-        const { data: d, error: dErr } = await supabase
-          .from("decks")
-          .select("id, name, ydk_text")
-          .eq("id", profile.equipped_deck_id)
-          .maybeSingle();
-
-        if (dErr) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "deck_query_failed", details: dErr.message }));
-        }
-        deck = d;
+      if (prof.error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "profile_query_failed", details: prof.error.message }));
       }
 
-      const duelHost = (dbMatch?.duel_host || DUEL_HOST);
+      if (!prof.data) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: "profile_not_found",
+            details: "No profile row matched this userId",
+            tried: ["firebase_uid", "id", "user_id", "uid", "auth_uid", "user_uid", "owner_id"],
+          })
+        );
+      }
+
+      const profile = prof.data;
+
+      // ====================== DECK (AJUSTADO AO SEU SCHEMA) ======================
+      // Mantém o campo equippedDeck no payload (não deletado), só muda a forma de buscar.
+      let deck = null;
+      const deckRes = await fetchEquippedDeck(userId);
+      if (deckRes.error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "deck_query_failed", details: deckRes.error.message }));
+      }
+      if (deckRes.data) deck = deckRes.data;
+
+      const duelHost = dbMatch?.duel_host || DUEL_HOST;
       const duelPort = Number(dbMatch?.duel_port || DUEL_PORT);
       const duelPass = String(dbMatch?.duel_pass ?? DUEL_PASS ?? "");
 
-
       const payload = {
         match: {
-        id: matchId,
-        duelHost,
-        duelPort,
-        room: roomId,
-        roomId: roomId, // ✅ compat extra para alguns launchers
-        pass: duelPass,
-        status: dbMatch?.status || "running",
+          id: matchId,
+          duelHost,
+          duelPort,
+          room: roomId,
+          roomId: roomId, // ✅ compat extra para alguns launchers
+          pass: duelPass,
+          status: dbMatch?.status || "running",
         },
 
         you: {
@@ -297,7 +354,7 @@ const profile = prof.data;
           avatarUrl: profile?.avatar_url || "",
           wizardMoney: profile?.wizard_money ?? 0,
           equippedDeck: deck
-            ? { id: deck.id, name: deck.name, ydkText: deck.ydk_text }
+            ? { id: deck.id, name: deck.name, ydkText: deck.ydkText || "" }
             : { id: "", name: "", ydkText: "" },
         },
         opponent: {
@@ -308,7 +365,8 @@ const profile = prof.data;
         meta: {
           joinKeyOneTime: JOIN_KEY_ONE_TIME,
           joinKeyTtlMs: JOIN_KEY_TTL_MS,
-        }
+          profileMatchedCol: prof.matchedCol || null,
+        },
       };
 
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -440,7 +498,11 @@ wss.on("connection", (ws) => {
 
   ws.on("message", async (buf) => {
     let msg;
-    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
     if (!msg?.type) return;
 
     const c = clients.get(ws);
@@ -477,49 +539,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-
-    async function fetchProfileByAnyKey(userId) {
-  // tenta várias colunas comuns sem quebrar
-  const candidates = [
-    "id",
-    "user_id",
-    "uid",
-    "firebase_uid",
-    "auth_uid",
-    "user_uid",
-    "owner_id",
-  ];
-
-  // campos que a gente quer (se algum não existir, tratamos pelo erro)
-  const selectBase = "username, team_tag, level, avatar_url, wizard_money, equipped_deck_id";
-
-  for (const col of candidates) {
-    const r = await supabase
-      .from("profiles")
-      .select(`${selectBase}, ${col}`)
-      .eq(col, userId)
-      .maybeSingle();
-
-    if (r.data) {
-      // devolve o profile junto com qual coluna bateu
-      return { data: r.data, error: null, matchedCol: col };
-    }
-
-    // se deu erro por coluna não existir, tenta a próxima
-    if (r.error && String(r.error.message || "").toLowerCase().includes("does not exist")) {
-      continue;
-    }
-
-    // outro erro real do banco
-    if (r.error) return { data: null, error: r.error, matchedCol: col };
-  }
-
-  // não achou em nenhuma coluna
-  return { data: null, error: null, matchedCol: null };
-}
-
-
-
     // ✅ NOVO: pedir joinKey pra rejoin
     if (msg.type === "REQUEST_JOIN_KEY") {
       const matchId = (msg.matchId || "").trim();
@@ -535,7 +554,7 @@ wss.on("connection", (ws) => {
       }
 
       // garante que esse user faz parte do match
-      const okMember = (dbMatch.p1_uid === c.userId || dbMatch.p2_uid === c.userId);
+      const okMember = dbMatch.p1_uid === c.userId || dbMatch.p2_uid === c.userId;
       if (!okMember) {
         send(ws, { type: "ERROR", message: "not_in_match" });
         return;
@@ -565,7 +584,9 @@ wss.on("connection", (ws) => {
 setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.readyState === WebSocket.OPEN) {
-      try { ws.ping(); } catch {}
+      try {
+        ws.ping();
+      } catch {}
     }
   }
 }, 25000).unref();
