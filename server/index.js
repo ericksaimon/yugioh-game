@@ -243,10 +243,10 @@ const server = http.createServer(async (req, res) => {
 
       // PERFIL
       const { data: profile, error: pErr } = await supabase
-        .from("profiles")
-        .select("id, username, team_tag, level, avatar_url, wizard_money, equipped_deck_id")
-        .eq("id", userId)
-        .maybeSingle();
+      .from("profiles")
+      .select("user_id, username, team_tag, level, avatar_url, wizard_money, equipped_deck_id")
+      .eq("user_id", userId)
+      .maybeSingle();
 
       if (pErr) {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -286,8 +286,8 @@ const server = http.createServer(async (req, res) => {
         },
 
         you: {
-          id: String(profile?.id || userId),
-          username: String(profile?.username || "Duelista"),
+          id: profile?.user_id || userId,
+          username: profile?.username || "Duelista",
           teamTag: profile?.team_tag || "",
           level: profile?.level ?? 1,
           avatarUrl: profile?.avatar_url || "",
