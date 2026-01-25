@@ -242,16 +242,20 @@ const server = http.createServer(async (req, res) => {
       }
 
       // PERFIL
-      const { data: profile, error: pErr } = await supabase
-      .from("profiles")
-      .select("user_id, username, team_tag, level, avatar_url, wizard_money, equipped_deck_id")
-      .eq("user_id", userId)
-      .maybeSingle();
+      const prof = await fetchProfileByAnyKey(userId);
 
-      if (pErr) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ error: "profile_query_failed", details: pErr.message }));
-      }
+if (prof.error) {
+  res.writeHead(500, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ error: "profile_query_failed", details: prof.error.message }));
+}
+
+if (!prof.data) {
+  res.writeHead(404, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ error: "profile_not_found", details: "No profile row matched this userId", tried: ["id","user_id","uid","firebase_uid","auth_uid","user_uid","owner_id"] }));
+}
+
+const profile = prof.data;
+
 
       // DECK
       let deck = null;
@@ -286,7 +290,7 @@ const server = http.createServer(async (req, res) => {
         },
 
         you: {
-          id: profile?.user_id || userId,
+          id: userId,
           username: profile?.username || "Duelista",
           teamTag: profile?.team_tag || "",
           level: profile?.level ?? 1,
@@ -472,6 +476,49 @@ wss.on("connection", (ws) => {
       send(ws, { type: "VIEW", view: "lobby" });
       return;
     }
+
+
+    async function fetchProfileByAnyKey(userId) {
+  // tenta várias colunas comuns sem quebrar
+  const candidates = [
+    "id",
+    "user_id",
+    "uid",
+    "firebase_uid",
+    "auth_uid",
+    "user_uid",
+    "owner_id",
+  ];
+
+  // campos que a gente quer (se algum não existir, tratamos pelo erro)
+  const selectBase = "username, team_tag, level, avatar_url, wizard_money, equipped_deck_id";
+
+  for (const col of candidates) {
+    const r = await supabase
+      .from("profiles")
+      .select(`${selectBase}, ${col}`)
+      .eq(col, userId)
+      .maybeSingle();
+
+    if (r.data) {
+      // devolve o profile junto com qual coluna bateu
+      return { data: r.data, error: null, matchedCol: col };
+    }
+
+    // se deu erro por coluna não existir, tenta a próxima
+    if (r.error && String(r.error.message || "").toLowerCase().includes("does not exist")) {
+      continue;
+    }
+
+    // outro erro real do banco
+    if (r.error) return { data: null, error: r.error, matchedCol: col };
+  }
+
+  // não achou em nenhuma coluna
+  return { data: null, error: null, matchedCol: null };
+}
+
+
 
     // ✅ NOVO: pedir joinKey pra rejoin
     if (msg.type === "REQUEST_JOIN_KEY") {
